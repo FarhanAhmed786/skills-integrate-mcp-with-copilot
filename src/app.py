@@ -5,19 +5,42 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, status, Form
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import datetime, timedelta
 import os
+import json
 from pathlib import Path
 
 app = FastAPI(title="Mergington High School API",
               description="API for viewing and signing up for extracurricular activities")
 
+# Authentication setup
+SECRET_KEY = "your-secret-key-here-change-in-production"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer(auto_error=False)
+
 # Mount the static files directory
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+# Load teachers from JSON file
+def load_teachers():
+    try:
+        with open(current_dir / "teachers.json", "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"teachers": {}}
+
+teachers_db = load_teachers()
 
 # In-memory activity database
 activities = {
@@ -74,8 +97,68 @@ activities = {
         "schedule": "Fridays, 4:00 PM - 5:30 PM",
         "max_participants": 12,
         "participants": ["charlotte@mergington.edu", "henry@mergington.edu"]
+    },
+    "GitHub Skills": {
+        "description": "Learn practical coding and collaboration skills using GitHub. First part of the GitHub Certifications program to help with college applications.",
+        "schedule": "Mondays and Thursdays, 3:30 PM - 4:30 PM",
+        "max_participants": 25,
+        "participants": []
     }
 }
+
+
+# Authentication helper functions
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def authenticate_teacher(username: str, password: str):
+    teachers = teachers_db.get("teachers", {})
+    teacher = teachers.get(username)
+    if not teacher:
+        return False
+    if not verify_password(password, teacher["password_hash"]):
+        return False
+    return teacher
+
+def create_access_token(data: dict, expires_delta: timedelta = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def get_current_teacher(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    if not credentials:
+        return None
+    
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        username: str = payload.get("sub")
+        if username is None:
+            return None
+    except JWTError:
+        return None
+    
+    teachers = teachers_db.get("teachers", {})
+    teacher = teachers.get(username)
+    if teacher is None:
+        return None
+    return {"username": username, "name": teacher["name"]}
+
+def require_teacher_auth(current_teacher = Depends(get_current_teacher)):
+    if current_teacher is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return current_teacher
 
 
 @app.get("/")
@@ -88,8 +171,34 @@ def get_activities():
     return activities
 
 
+@app.post("/auth/login")
+def login(username: str = Form(...), password: str = Form(...)):
+    """Teacher login endpoint"""
+    teacher = authenticate_teacher(username, password)
+    if not teacher:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect username or password",
+        )
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": username}, expires_delta=access_token_expires
+    )
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "teacher_name": teacher["name"]
+    }
+
+
+@app.get("/auth/me")
+def get_current_teacher_info(current_teacher = Depends(get_current_teacher)):
+    """Get current teacher information if logged in"""
+    return current_teacher
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(activity_name: str, email: str, current_teacher = Depends(require_teacher_auth)):
     """Sign up a student for an activity"""
     # Validate activity exists
     if activity_name not in activities:
@@ -111,7 +220,7 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(activity_name: str, email: str, current_teacher = Depends(require_teacher_auth)):
     """Unregister a student from an activity"""
     # Validate activity exists
     if activity_name not in activities:
